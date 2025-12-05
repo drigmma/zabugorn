@@ -1,0 +1,5 @@
+aiogram
+python-dotenv
+aiosqlite
+gspread
+google-auth
