@@ -34,13 +34,12 @@ SUPPORT_CONTACT = os.environ.get("SUPPORT_CONTACT")
 GOOGLE_CREDS_JSON_PATH = os.environ.get("GOOGLE_CREDS_JSON_PATH")
 GOOGLE_CREDS_JSON_CONTENT = os.environ.get("GOOGLE_CREDS_JSON_CONTENT")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME")
+WORKSHEET_NAME = os.environ.get("WORKSHEET_NAME", "Заявки")
 
 DB_PATH = os.environ.get("DB_PATH", "requests.db")
-AUTO_CONVERT_8_TO_7 = os.environ.get("AUTO_CONVERT_8_TO_7", "1") == "1"
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable required")
+    raise RuntimeError("BOT_TOKEN is not set")
 
 ADMINS = []
 for a in ADMIN_IDS_RAW.split(","):
@@ -90,98 +89,75 @@ CREATE TABLE IF NOT EXISTS requests (
 )
 """
 
-async def migrate_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("PRAGMA table_info(requests)")
-        columns = await cursor.fetchall()
-        column_names = [col[1] for col in columns]
-        
-        if 'phones' not in column_names:
-            logger.info("Adding 'phones' column to requests table...")
-            try:
-                await db.execute("ALTER TABLE requests ADD COLUMN phones TEXT DEFAULT '-'")
-                await db.commit()
-                logger.info("Column 'phones' added successfully")
-            except Exception as e:
-                logger.error("Failed to add 'phones' column: %s", e)
-                raise
+...
+# Этот "..." просто как заглушка, не влияет на логику
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_TABLE_SQL)
-        await db.commit()
-    await migrate_db()
+# ---------- Simple in-memory consent storage ----------
+class ConsentStore:
+    def __init__(self):
+        self._store = {}
 
-# ---------- Google Sheets helpers ----------
-_GS_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+    def set(self, user_id: int, value: bool):
+        self._store[user_id] = value
 
-def _load_service_account_credentials() -> Optional[GoogleCredentials]:
-    try:
-        if GOOGLE_CREDS_JSON_PATH and os.path.isfile(GOOGLE_CREDS_JSON_PATH):
-            logger.info("Loading Google credentials from file: %s", GOOGLE_CREDS_JSON_PATH)
-            creds = GoogleCredentials.from_service_account_file(GOOGLE_CREDS_JSON_PATH, scopes=_GS_SCOPES)
-            return creds
+    def get(self, user_id: int, default=False) -> bool:
+        return self._store.get(user_id, default)
 
-        if GOOGLE_CREDS_JSON_CONTENT:
-            logger.info("Loading Google credentials from JSON content in env var")
-            info = json.loads(GOOGLE_CREDS_JSON_CONTENT)
-            creds = GoogleCredentials.from_service_account_info(info, scopes=_GS_SCOPES)
-            return creds
+CONSENT_STORE = ConsentStore()
 
-        logger.warning("No Google credentials provided. Set GOOGLE_CREDS_JSON_PATH or GOOGLE_CREDS_JSON_CONTENT")
-        return None
-    except Exception as e:
-        logger.exception("Failed to load Google service account credentials: %s", e)
-        return None
+# ---------- Google Sheets ----------
+def get_google_client():
+    """
+    Инициализация клиента Google Sheets.
 
-def get_gspread_client():
-    creds = _load_service_account_credentials()
-    if not creds:
-        return None
-    try:
-        client = gspread.authorize(creds)
-        return client
-    except Exception as e:
-        logger.exception("Error authorizing gspread client: %s", e)
-        return None
+    Можно либо передать путь к файлу JSON сервисного аккаунта через GOOGLE_CREDS_JSON_PATH,
+    либо указать содержимое JSON целиком в переменной GOOGLE_CREDS_JSON_CONTENT.
+    """
+    if GOOGLE_CREDS_JSON_PATH:
+        logger.info("Loading Google credentials from JSON file: %s", GOOGLE_CREDS_JSON_PATH)
+        creds = GoogleCredentials.from_service_account_file(
+            GOOGLE_CREDS_JSON_PATH,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+    elif GOOGLE_CREDS_JSON_CONTENT:
+        logger.info("Loading Google credentials from JSON content in env var")
+        info = json.loads(GOOGLE_CREDS_JSON_CONTENT)
+        creds = GoogleCredentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+    else:
+        raise RuntimeError("No Google service account credentials provided")
 
-async def append_to_sheet(row: list) -> Optional[int]:
-    creds_available = bool(GOOGLE_CREDS_JSON_PATH or GOOGLE_CREDS_JSON_CONTENT)
-    if not creds_available:
-        logger.info("Google Sheets not configured (no credentials). Skipping append.")
-        return None
+    client = gspread.authorize(creds)
+    return client
 
-    client = get_gspread_client()
-    if not client:
-        logger.warning("Could not create gspread client")
-        return None
-
-    try:
-        if SPREADSHEET_ID:
+async def append_to_sheet(row_values):
+    """
+    Добавление строки в Google Sheets. Выполняется в отдельном потоке, чтобы не блокировать event loop.
+    """
+    loop = asyncio.get_running_loop()
+    def _append():
+        try:
+            client = get_google_client()
             sh = client.open_by_key(SPREADSHEET_ID)
-        else:
-            sh = client.open(GOOGLE_SHEET_NAME)
+            worksheet = sh.worksheet(WORKSHEET_NAME)
+            worksheet.append_row(row_values, value_input_option="USER_ENTERED")
+            row_number = len(worksheet.get_all_values())
+            return row_number
+        except Exception as e:
+            logger.exception("Error while appending to Google Sheets: %s", e)
+            return None
 
-        worksheet = sh.sheet1
-        worksheet.append_row(row, value_input_option='USER_ENTERED')
-        values = worksheet.get_all_values()
-        last = len(values)
-        return last
-    except Exception as e:
-        logger.exception("Error appending to sheet: %s", e)
-        return None
+    row_number = await loop.run_in_executor(None, _append)
+    return row_number
+
+# ---------- Bot initialization ----------
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=storage)
 
 # ---------- Keyboards ----------
-def privacy_keyboard():
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, ознакомился(ась)", callback_data="privacy_yes")],
-        [InlineKeyboardButton(text="❌ Нет, не согласен(на)", callback_data="privacy_no")]
-    ])
-    return kb
-
 def main_user_keyboard():
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📋 Оставить заявку на автомобиль")],
@@ -198,120 +174,131 @@ def contact_request_kb():
 
 def username_inline_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Вставить мой username", callback_data="use_my_username")]
+        [InlineKeyboardButton(text="🔗 Вставить мой username", callback_data="use_username")]
     ])
     return kb
 
-def admin_request_kb(request_id: int, phone: str, user_id: int):
+def request_inline_kb(request_id: int, sheet_row: Optional[int]):
     buttons = [
-        [InlineKeyboardButton(text="💌 Написать", callback_data=f"admin_msg:{user_id}")],
-        [InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"take:{request_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{request_id}")]
+        [
+            InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"take:{request_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{request_id}")
+        ],
+        [
+            InlineKeyboardButton(text="💌 Написать", callback_data=f"admin_msg:{request_id}")
+        ]
     ]
+    if sheet_row:
+        buttons.append(
+            [InlineKeyboardButton(text="📄 Открыть в таблице", url=f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid=0&range=A{sheet_row}")]
+        )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# ---------- Bot init ----------
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+# ---------- Database helpers ----------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(CREATE_TABLE_SQL)
+        await db.commit()
 
-CONSENT_STORE = {}
+async def save_request_to_db(
+    user_id: int,
+    username: str,
+    name: str,
+    phones: str,
+    brand_model: str,
+    exterior: str,
+    interior: str,
+    package: str,
+    budget: str,
+    year: str,
+    wishes: str,
+    sheet_row: Optional[int]
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO requests (
+                user_id, username, name, phones, brand_model,
+                exterior, interior, package, budget, year,
+                wishes, sheet_row
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, username, name, phones, brand_model,
+             exterior, interior, package, budget, year,
+             wishes, sheet_row)
+        )
+        await db.commit()
+        return cursor.lastrowid
 
+async def update_request_status(request_id: int, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE requests SET status=? WHERE id=?", (status, request_id))
+        await db.commit()
+
+async def get_request_by_id(request_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id, user_id, username, name, phones, brand_model, exterior, interior, package, budget, year, wishes, sheet_row, status "
+            "FROM requests WHERE id=?",
+            (request_id,)
+        )
+        row = await cursor.fetchone()
+    return row
+
+# ---------- Support state holder ----------
 class SupportStateHolder:
-    _support_waiting = set()
+    """
+    Простая in-memory структура для хранения того,
+    что пользователь сейчас пишет в поддержку.
+    """
+    _support_users = set()
+
     @classmethod
     def set_support_state(cls, user_id: int):
-        cls._support_waiting.add(user_id)
-    @classmethod
-    def is_waiting(cls, user_id: int) -> bool:
-        return user_id in cls._support_waiting
+        cls._support_users.add(user_id)
+
     @classmethod
     def remove(cls, user_id: int):
-        cls._support_waiting.discard(user_id)
+        cls._support_users.discard(user_id)
 
-# ---------- Validation helpers ----------
-NAME_RE = re.compile(r"^[А-Яа-яЁё\-\s]+$")
-PHONE_RE = re.compile(r"^\+7\d{10}$")
+    @classmethod
+    def is_waiting(cls, user_id: int) -> bool:
+        return user_id in cls._support_users
 
-def normalize_phone(p: Optional[str]) -> str:
-    if not p:
-        return "-"
-    p = p.strip()
-    if p.startswith("+"):
-        digits = re.sub(r"\D", "", p)
-        if not digits:
-            return "-"
+# ---------- Misc helpers ----------
+def normalize_phone(phone: str) -> str:
+    digits = re.sub(r"\D+", "", phone)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    if digits.startswith("7"):
         return "+" + digits
-
-    digits = re.sub(r"\D", "", p)
-    if not digits:
-        return "-"
-
-    if AUTO_CONVERT_8_TO_7 and digits.startswith("8") and len(digits) >= 10:
-        return "+7" + digits[1:]
-
-    return "+" + digits
-
-def tz_now_str() -> str:
-    try:
-        tz = ZoneInfo("Asia/Jerusalem")
-        return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %z")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return phone
 
 # ---------- Handlers ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    await message.answer(
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "Перед началом работы ознаклмьтесь с политикой обработки персональных данных: "
-"""Настоящим я, пользователь телеграм-бота, адресуемого доменным именем «https://t.me/AutoLuxZabugonBot», в соответствии с Федеральным законом от 27.07.2006 № 152-ФЗ «О персональных данных» свободно, в своей воле и в своем интересе, а также подтверждая свою дееспособность, даю согласие арбитражному управляющему Ульянину Алексею Викторовичу (далее – Оператор) (ИНН 631302292685, адрес места нахождения: 443001, г.Самара, ул. Ульяновская, д. 52 оф. 510, 5 этаж, адрес электронной почты info@ульянин.рф, телефон контакта 8 (800) 511-34-09), на обработку своих персональных данных на следующих условиях:
+    CONSENT_STORE.set(message.from_user.id, True)
+    await state.clear()
+    text = (
+        "👋 <b>Здравствуйте!</b>\n\n"
+        "Я бот компании <b>ЗАБУГОРНЫЙLUX</b>.\n\n"
+        "Через меня вы можете:\n"
+        "• 📋 Оставить заявку на подбор автомобиля\n"
+        "• 💬 Написать в поддержку\n\n"
+        "Выберите нужный пункт в меню ниже."
+    )
+    await message.answer(text, reply_markup=main_user_keyboard(), parse_mode="HTML")
 
-1. Согласие дается на обработку следующих персональных данных: имя, номер телефона
-
-2. Цель обработки персональных данных: 
-идентификация пользователя сайта в целях консультирования пользователя;
-обеспечение связи с субъектом персональных данных;
-заключение соглашений с Оператором и предоставления персонализированных услуг;
-оказание услуг по договору оказания услуг с Оператором;
-контроль качества услуг, оказываемых Оператором.
-
-3. Согласие предоставляется на осуществление любых действий в отношении персональных данных, которые необходимы для достижения указанных выше целей, включая (без ограничения) сбор, запись, систематизацию, накопление, хранение, уточнение (обновление, изменение), извлечение, использование, обезличивание, блокирование, удаление.
-
-4. Полученные Оператором персональные данные не передаются Оператором третьим лицам.
-
-5. Персональные данные хранятся на территории Российской Федерации и не передаются на территорию иностранного государства.
-
-6. Оператор вправе осуществлять автоматизированную обработку персональных данных, так и обработку персональных данных без использования средств автоматизации, в том числе с передачей по каналам связи, защита которых обеспечивается путем реализации соответствующих правовых, организационных и технических мер, предусмотренных законодательством о защите персональных данных.
-
-7. Согласие действует с даты его подписания и действует в течение 3 (трех) лет. По истечении указанного срока действие согласия считается продленным на каждые следующие три года при отсутствии сведений о его отзыве.
-
-8. Согласие может быть отозвано путем направления письменного заявления по адресу, указанному в начале текста настоящего Согласия. В соответствии с п. 12 ст. 10.1 Федерального закона от 27.07.2006 г. № 152-ФЗ «О персональных данных» требование должно включать в себя фамилию, имя, отчество (при наличии), контактную информацию (номер телефона, адрес электронной почты или почтовый адрес), а также перечень персональных данных, обработка которых подлежит прекращению.
-
-Согласие дано мной и считается подписанным в день акцепта условий настоящего согласия, путем совершения конклюдентных действий: идентификация пользователя на сайте Оператора (внесение сведений, позволяющих идентифицировать обладателя персональных данных), проставления отметок (галочек) о согласии с условиями настоящего согласия.""",
-        reply_markup=privacy_keyboard(),
+@dp.message(Command(commands=["help"]))
+async def cmd_help(message: Message):
+    await message.reply(
+        "ℹ️ Для работы используйте кнопки меню:\n"
+        "• 📋 Оставить заявку на автомобиль\n"
+        "• 💬 Написать в поддержку",
         parse_mode="HTML"
     )
-
-@dp.callback_query(F.data.startswith("privacy_"))
-async def privacy_answer(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    if cb.data == "privacy_yes":
-        CONSENT_STORE[user_id] = True
-        await cb.message.edit_text("✅ <b>Спасибо!</b>\n\nВы можете продолжить работу с ботом.", parse_mode="HTML")
-        await bot.send_message(
-            user_id,
-            "🚗 <b>Что вы хотите сделать?</b>",
-            reply_markup=main_user_keyboard(),
-            parse_mode="HTML"
-        )
-    else:
-        CONSENT_STORE[user_id] = False
-        await cb.message.edit_text(
-            "❌ К сожалению, без согласия на обработку персональных данных вы не можете пользоваться ботом.",
-            parse_mode="HTML"
-        )
-    await cb.answer()
 
 @dp.message(F.text == "💬 Написать в поддержку")
 async def ask_support(message: Message):
@@ -321,7 +308,7 @@ async def ask_support(message: Message):
         return
     await message.reply(
         "📝 <b>Напишите вашу проблему или вопрос</b>\n\n"
-        "Сообщение будет отправлено нашему менеджеру, и мы свяжемся с вами.",
+        "Сообщение будет отправлено нашему менеджеру ЗАБУГОРНЫЙLUX, и мы свяжемся с вами.",
         parse_mode="HTML"
     )
     SupportStateHolder.set_support_state(user_id)
@@ -343,270 +330,327 @@ async def start_form_handler(message: Message, state: FSMContext):
 async def process_name(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if not text:
-        await message.reply("❌ Пожалуйста, введите ФИО кириллицей (например: Иванов Иван Иванович).")
-        return
-    if not NAME_RE.match(text):
-        await message.reply("❌ ФИО должно содержать только кириллицу, пробелы и дефис. Пожалуйста, попробуйте ещё раз.")
-        return
-    parts = [p for p in text.split() if p.strip()]
-    if len(parts) < 2:
-        await message.reply("❌ Пожалуйста, введите минимум фамилию и имя (например: Иванов Иван).")
+        await message.reply("❗ Пожалуйста, введите имя текстом.")
         return
     await state.update_data(name=text)
     await message.answer(
-        "☎️ <b>Укажите номер телефона</b>\n\n"
-        "Используйте международный формат (например +7...)",
+        "📱 <b>Укажите ваш номер телефона</b>\n\n"
+        "Вы можете отправить контакт кнопкой ниже или ввести номер вручную.",
         reply_markup=contact_request_kb(),
         parse_mode="HTML"
     )
     await state.set_state(Form.phone)
 
+@dp.message(Form.phone, F.contact)
+async def process_phone_contact(message: Message, state: FSMContext):
+    contact: Contact = message.contact
+    phone = contact.phone_number
+    phone_norm = normalize_phone(phone)
+    await state.update_data(phone=phone_norm)
+    await ask_username(message, state)
+
 @dp.message(Form.phone)
-async def process_phone(message: Message, state: FSMContext):
-    phone_raw = None
-    if getattr(message, "contact", None) and isinstance(message.contact, Contact):
-        phone_raw = message.contact.phone_number
-    else:
-        phone_raw = message.text or ""
-    phone = normalize_phone(phone_raw)
-    if phone != "-" and not PHONE_RE.match(phone):
-        await message.reply("❌ Неверный формат номера. Введите в формате +7... или используйте кнопку 'Отправить номер'.")
+async def process_phone_manual(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("❗ Введите номер телефона или отправьте контакт.")
         return
-    await state.update_data(phone=phone)
+    phone_norm = normalize_phone(text)
+    await state.update_data(phone=phone_norm)
+    await ask_username(message, state)
+
+async def ask_username(message: Message, state: FSMContext):
     await message.answer(
-        "👤 <b>Ваш Telegram username</b>",
+        "💬 <b>Укажите ваш Telegram username</b> (если есть),\n"
+        "или нажмите кнопку ниже, чтобы вставить автоматически.",
         reply_markup=username_inline_kb(),
         parse_mode="HTML"
     )
     await state.set_state(Form.username)
 
-@dp.callback_query(F.data == "use_my_username")
-async def use_my_username(cb: CallbackQuery, state: FSMContext):
-    raw = cb.from_user.username or "-"
-    if raw == "-":
-        username = "-"
+@dp.callback_query(F.data == "use_username")
+async def cb_use_username(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.username:
+        uname = "@" + cb.from_user.username
+        await state.update_data(username=uname)
+        await cb.message.edit_text(
+            f"Ваш username: <b>{uname}</b>",
+            parse_mode="HTML"
+        )
+        await ask_extra_phone(cb.message, state)
     else:
-        username = raw if raw.startswith("@") else "@" + raw
-    await state.update_data(username=username)
-    await cb.answer()
-    await cb.message.edit_text(f"✅ Username выбран: <b>{username}</b>", parse_mode="HTML")
-    await bot.send_message(
-        cb.from_user.id,
-        "☎️ <b>Дополнительный номер телефона</b> (если есть)\n\n"
-        "Введите в формате +7... или напишите '-' если не нужен",
-        reply_markup=contact_request_kb(),
-        parse_mode="HTML"
-    )
-    await state.set_state(Form.extra_phone)
+        await cb.answer("У вас нет username в Telegram", show_alert=True)
 
 @dp.message(Form.username)
 async def process_username(message: Message, state: FSMContext):
     text = (message.text or "").strip()
-    if not text:
-        await message.reply("❌ Пожалуйста, введите username или нажмите кнопку 'Вставить мой username'.")
-        return
-    if text != '-' and not text.startswith('@'):
-        text = '@' + text
+    if text and not text.startswith("@"):
+        text = "@" + text
     await state.update_data(username=text)
+    await ask_extra_phone(message, state)
+
+async def ask_extra_phone(message: Message, state: FSMContext):
     await message.answer(
-        "☎️ <b>Дополнительный номер телефона</b> (если есть)\n\n"
-        "Введите в формате +7... или напишите '-' если не нужен",
-        reply_markup=contact_request_kb(),
+        "📞 <b>Дополнительный номер телефона</b>\n\n"
+        "Если хотите, укажите ещё один номер телефона или напишите <i>«нет»</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.extra_phone)
 
 @dp.message(Form.extra_phone)
 async def process_extra_phone(message: Message, state: FSMContext):
-    raw = None
-    if getattr(message, "contact", None) and isinstance(message.contact, Contact):
-        raw = message.contact.phone_number
+    text = (message.text or "").strip().lower()
+    if text in ("нет", "no", "не надо", "нету", "none", "ничего"):
+        await state.update_data(extra_phone="")
     else:
-        raw = message.text or ""
-    
-    if raw.strip() == "-":
-        extra = "-"
-    else:
-        extra = normalize_phone(raw)
-        if extra != "-" and not PHONE_RE.match(extra):
-            await message.reply("❌ Неверный формат. Номер должен быть в формате +7 с 10-15 цифрами, или напишите '-'.")
-            return
-    
-    await state.update_data(extra_phone=extra)
+        phone_norm = normalize_phone(message.text or "")
+        await state.update_data(extra_phone=phone_norm)
     await message.answer(
-        "🚗 <b>Какую марку автомобиля вы хотите заказать?</b>\n\n"
-        "(например: BMW X5, Mercedes-Benz GLE)",
+        "🚗 <b>Марка и модель автомобиля</b>\n\n"
+        "Например: <i>Mercedes-Benz S-Class</i>",
         parse_mode="HTML"
     )
     await state.set_state(Form.brand_model)
 
 @dp.message(Form.brand_model)
-async def process_brand(message: Message, state: FSMContext):
-    await state.update_data(brand_model=message.text or "-")
+async def process_brand_model(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("❗ Введите марку и модель автомобиля.")
+        return
+    await state.update_data(brand_model=text)
     await message.answer(
-        "🎨 <b>Экстерьер</b>\n\n"
-        "(цвет, состояние, пробег и т.д.)",
+        "🎨 <b>Желаемый цвет экстерьера (кузова)</b>\n\n"
+        "Например: <i>чёрный, белый, не принципиально</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.exterior)
 
 @dp.message(Form.exterior)
 async def process_exterior(message: Message, state: FSMContext):
-    await state.update_data(exterior=message.text or "-")
+    text = (message.text or "").strip()
+    await state.update_data(exterior=text)
     await message.answer(
-        "🛋 <b>Интерьер</b>\n\n"
-        "(материалы, состояние и т.д.)",
+        "🪑 <b>Желаемый цвет/тип интерьера салона</b>\n\n"
+        "Например: <i>чёрный кожа, бежевый, ткань, не принципиально</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.interior)
 
 @dp.message(Form.interior)
 async def process_interior(message: Message, state: FSMContext):
-    await state.update_data(interior=message.text or "-")
+    text = (message.text or "").strip()
+    await state.update_data(interior=text)
     await message.answer(
-        "📦 <b>Комплектация/Пакет</b>",
+        "📦 <b>Комплектация</b>\n\n"
+        "Укажите пожелания по комплектации (опции, пакеты) или напишите <i>«стандарт»</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.package)
 
 @dp.message(Form.package)
 async def process_package(message: Message, state: FSMContext):
-    await state.update_data(package=message.text or "-")
+    text = (message.text or "").strip()
+    await state.update_data(package=text)
     await message.answer(
-        "💰 <b>Ваш бюджет</b>\n\n"
-        "(включая логистику и растаможку)",
+        "💰 <b>Бюджет</b>\n\n"
+        "Укажите бюджет на автомобиль (в рублях), например: <i>от 5 до 7 млн</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.budget)
 
 @dp.message(Form.budget)
 async def process_budget(message: Message, state: FSMContext):
-    await state.update_data(budget=message.text or "-")
+    text = (message.text or "").strip()
+    await state.update_data(budget=text)
     await message.answer(
-        "📅 <b>Год выпуска</b>",
+        "📅 <b>Желаемый год выпуска</b>\n\n"
+        "Например: <i>от 2020, 2018-2022, не старше 5 лет</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.year)
 
 @dp.message(Form.year)
 async def process_year(message: Message, state: FSMContext):
-    await state.update_data(year=message.text or "-")
-    # priority question removed — сразу переходим к пожеланиям
+    text = (message.text or "").strip()
+    await state.update_data(year=text)
     await message.answer(
-        "✨ <b>Пожелания и комментарии</b>\n\n"
-        "(если есть, или напишите '-')",
+        "✏️ <b>Дополнительные пожелания</b>\n\n"
+        "Напишите всё, что считаете важным: пробег, состояние, страна привоза, и т.д.\n"
+        "Если пожеланий нет — напишите <i>«нет»</i>.",
         parse_mode="HTML"
     )
     await state.set_state(Form.wishes)
 
 @dp.message(Form.wishes)
 async def process_wishes(message: Message, state: FSMContext):
-    await state.update_data(wishes=message.text or "-")
+    text = (message.text or "").strip()
+    if text.lower() in ("нет", "no", "none", "ничего"):
+        text = ""
+    await state.update_data(wishes=text)
+
     data = await state.get_data()
+
     user = message.from_user
+    user_id = user.id
+    username = data.get("username") or (f"@{user.username}" if user.username else "")
+    name = data.get("name", "")
+    phone = data.get("phone", "")
+    extra_phone = data.get("extra_phone", "")
+    brand_model = data.get("brand_model", "")
+    exterior = data.get("exterior", "")
+    interior = data.get("interior", "")
+    package = data.get("package", "")
+    budget = data.get("budget", "")
+    year = data.get("year", "")
+    wishes = data.get("wishes", "")
 
-    phones_combined = f"({data.get('phone','-')}), ({data.get('extra_phone','-')})"
+    phones_combined = phone
+    if extra_phone:
+        phones_combined += f", {extra_phone}"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            # priority column intentionally omitted from INSERT; DB has default value
-            "INSERT INTO requests (user_id, username, name, phones, brand_model, exterior, interior, package, budget, year, wishes) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                user.id,
-                data.get('username', '-'),
-                data.get('name', '-'),
-                phones_combined,
-                data.get('brand_model', '-'),
-                data.get('exterior', '-'),
-                data.get('interior', '-'),
-                data.get('package', '-'),
-                data.get('budget', '-'),
-                data.get('year', '-'),
-                data.get('wishes', '-')
-            )
-        )
-        await db.commit()
-        request_id = cursor.lastrowid
+    tz = ZoneInfo("Europe/Moscow")
+    now = datetime.now(tz).strftime("%d.%m.%Y %H:%M")
 
-    timestamp = tz_now_str()
-    row = [
-        timestamp,
-        data.get('name', '-'),
+    row_values = [
+        str(user_id),
+        username,
+        name,
         phones_combined,
-        data.get('username', '-'),
-        data.get('brand_model', '-'),
-        data.get('exterior', '-'),
-        data.get('interior', '-'),
-        data.get('package', '-'),
-        data.get('budget', '-'),
-        data.get('year', '-'),
-        # priority omitted
-        data.get('wishes', '-')
+        brand_model,
+        exterior,
+        interior,
+        package,
+        budget,
+        year,
+        wishes,
+        "new",
+        now
     ]
-    sheet_row = await append_to_sheet(row)
 
-    if sheet_row is not None:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE requests SET sheet_row = ? WHERE id = ?", (sheet_row, request_id))
-            await db.commit()
+    await message.answer("⏳ Сохраняем вашу заявку, пожалуйста подождите...")
 
-    await message.answer(
-        "✅ <b>Спасибо!</b>\n\n"
-        "Ваша заявка успешно отправлена 🎉\n"
-        "Наш менеджер ЗАБУГОРНЫЙLUX свяжется с вами в ближайшее время!",
-        reply_markup=types.ReplyKeyboardRemove(),
-        parse_mode="HTML"
+    sheet_row = await append_to_sheet(row_values)
+    request_id = await save_request_to_db(
+        user_id=user_id,
+        username=username,
+        name=name,
+        phones=phones_combined,
+        brand_model=brand_model,
+        exterior=exterior,
+        interior=interior,
+        package=package,
+        budget=budget,
+        year=year,
+        wishes=wishes,
+        sheet_row=sheet_row
     )
-
-    msg_text = (
-        f"🆕 <b>Новая заявка #{request_id}</b>\n\n"
-        f"👤 <b>ФИО:</b> {data.get('name')}\n"
-        f"☎️ <b>Телефоны:</b> {phones_combined}\n"
-        f"👤 <b>Username:</b> {data.get('username')}\n"
-        f"🚗 <b>Марка/модель:</b> {data.get('brand_model')}\n"
-        f"🎨 <b>Экстерьер:</b> {data.get('exterior')}\n"
-        f"🛋 <b>Интерьер:</b> {data.get('interior')}\n"
-        f"📦 <b>Комплектация:</b> {data.get('package')}\n"
-        f"💰 <b>Бюджет:</b> {data.get('budget')}\n"
-        f"📅 <b>Год:</b> {data.get('year')}\n"
-        # priority line removed
-        f"✨ <b>Пожелания:</b> {data.get('wishes')}\n"
-    )
-    for admin in ADMINS:
-        try:
-            await bot.send_message(
-                admin,
-                msg_text,
-                reply_markup=admin_request_kb(request_id, phones_combined, user.id),
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.warning("Failed to send request to admin %s: %s", admin, e)
 
     await state.clear()
 
-# ---------- Admin callbacks ----------
+    text_confirm = (
+        "✅ <b>Ваша заявка сохранена!</b>\n\n"
+        f"Номер заявки: <b>{request_id}</b>\n"
+        "Наш менеджер свяжется с вами в ближайшее время."
+    )
+    await message.answer(text_confirm, parse_mode="HTML", reply_markup=main_user_keyboard())
+
+    await notify_admins_new_request(
+        request_id=request_id,
+        user_id=user_id,
+        username=username,
+        name=name,
+        phones=phones_combined,
+        brand_model=brand_model,
+        exterior=exterior,
+        interior=interior,
+        package=package,
+        budget=budget,
+        year=year,
+        wishes=wishes,
+        sheet_row=sheet_row
+    )
+
+async def notify_admins_new_request(
+    request_id: int,
+    user_id: int,
+    username: str,
+    name: str,
+    phones: str,
+    brand_model: str,
+    exterior: str,
+    interior: str,
+    package: str,
+    budget: str,
+    year: str,
+    wishes: str,
+    sheet_row: Optional[int]
+):
+    if not ADMINS:
+        logger.warning("No admins configured, cannot notify about new request")
+        return
+
+    text = (
+        "🆕 <b>Новая заявка</b>\n\n"
+        f"<b>ID:</b> {request_id}\n"
+        f"<b>Пользователь:</b> {name}\n"
+        f"<b>Telegram:</b> {username or 'нет'}\n"
+        f"<b>Телефоны:</b> {phones}\n"
+        f"<b>Авто:</b> {brand_model}\n"
+        f"<b>Экстерьер:</b> {exterior}\n"
+        f"<b>Интерьер:</b> {interior}\n"
+        f"<b>Комплектация:</b> {package}\n"
+        f"<b>Бюджет:</b> {budget}\n"
+        f"<b>Год:</b> {year}\n"
+        f"<b>Пожелания:</b> {wishes or '—'}\n"
+    )
+
+    kb = request_inline_kb(request_id, sheet_row)
+
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(
+                admin_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.warning("Failed to notify admin %s: %s", admin_id, e)
+
 @dp.callback_query(F.data.startswith("take:"))
-async def take_request(cb: CallbackQuery):
-    req_id = int(cb.data.split(":", 1)[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE requests SET status = 'in_progress' WHERE id = ?", (req_id,))
-        await db.commit()
-    await cb.answer("✅ Заявка взята в работу")
+async def cb_take_request(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
     try:
-        await cb.message.edit_reply_markup()
+        request_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный ID", show_alert=True)
+        return
+
+    await update_request_status(request_id, "in_progress")
+    await cb.answer("Заявка взята в работу")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-@dp.callback_query(F.data.startswith("delete:"))
-async def delete_request(cb: CallbackQuery):
-    req_id = int(cb.data.split(":", 1)[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM requests WHERE id = ?", (req_id,))
-        await db.commit()
-    await cb.answer("✅ Заявка удалена")
+@dp.callback_query(F.data.startswith("reject:"))
+async def cb_reject_request(cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
     try:
-        await cb.message.edit_text(cb.message.text + "\n\n<i>(заявка удалена)</i>", parse_mode="HTML")
+        request_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный ID", show_alert=True)
+        return
+
+    await update_request_status(request_id, "rejected")
+    await cb.answer("Заявка отклонена")
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
@@ -650,9 +694,14 @@ async def list_requests(message: Message):
         return
     for r in rows:
         req_id, name, phones, brand_model, status = r
-        status_emoji = "🆕" if status == "new" else "⏳" if status == "in_progress" else "✅"
-        text = f"#{req_id}\n👤 {name}\n🚗 {brand_model}\n☎️ {phones}\n{status_emoji} {status}"
-        await message.reply(text, reply_markup=admin_request_kb(req_id, phones, 0))
+        status_emoji = "🆕" if status == "new" else ("⚙️" if status == "in_progress" else "❌")
+        await message.reply(
+            f"{status_emoji} <b>Заявка {req_id}</b>\n"
+            f"<b>Имя:</b> {name}\n"
+            f"<b>Телефоны:</b> {phones}\n"
+            f"<b>Авто:</b> {brand_model}",
+            parse_mode="HTML"
+        )
 
 @dp.message()
 async def catch_all_messages(message: Message):
@@ -661,6 +710,9 @@ async def catch_all_messages(message: Message):
     if SupportStateHolder.is_waiting(user_id):
         for admin in ADMINS:
             try:
+                reply_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💌 Ответить пользователю", callback_data=f"admin_msg:{user_id}")]
+                ])
                 await bot.send_message(
                     admin,
                     (
@@ -668,13 +720,16 @@ async def catch_all_messages(message: Message):
                         f"От: {message.from_user.full_name} (@{message.from_user.username or 'нет username'})\n\n"
                         f"{text}"
                     ),
+                    reply_markup=reply_kb,
                     parse_mode="HTML"
                 )
             except Exception as e:
                 logger.warning("Failed to forward support to admin %s: %s", admin, e)
         SupportStateHolder.remove(user_id)
         await message.answer(
-            "✅ <b>Спасибо!</b>\n\nВаше сообщение отправлено в поддержку. Мы с Вами свяжимся.",
+            "✅ <b>Спасибо!</b>\n\n"
+            "Ваше сообщение отправлено в поддержку.\n"
+            "Наш менеджер ЗАБУГОРНЫЙLUX свяжется с Вами.",
             parse_mode="HTML"
         )
         return
@@ -697,3 +752,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         logger.exception("Unhandled exception in bot: %s", e)
+        
